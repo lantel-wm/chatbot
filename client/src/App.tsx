@@ -4,6 +4,8 @@ import {
   Copy,
   Download,
   Edit3,
+  ExternalLink,
+  Globe2,
   MessageSquare,
   PanelLeft,
   Plus,
@@ -29,10 +31,13 @@ import remarkGfm from "remark-gfm";
 import {
   DEFAULT_MODEL,
   MODEL_OPTIONS,
+  WEB_SEARCH_INTENSITY_OPTIONS,
   type ChatMessage,
   type ChatModel,
   type Conversation,
-  type StoredChatState
+  type StoredChatState,
+  type WebSearchContext,
+  type WebSearchIntensity
 } from "./types";
 import {
   createConversation,
@@ -48,12 +53,19 @@ import {
 interface GenerationState {
   conversationId: string;
   messageId: string;
+  webSearchEnabled: boolean;
+  webSearchIntensity: WebSearchIntensity;
 }
 
-interface StreamEvent {
-  type: "reasoning" | "content" | "error";
-  content: string;
-}
+type StreamEvent =
+  | {
+      type: "reasoning" | "content" | "error";
+      content: string;
+    }
+  | {
+      type: "search_results";
+      search: WebSearchContext;
+    };
 
 const markdownComponents: Components = {
   a({ children, ...props }) {
@@ -100,6 +112,38 @@ function CodeBlock({ children }: { children: ReactNode }) {
   );
 }
 
+function SearchSources({ search }: { search: WebSearchContext }) {
+  return (
+    <details className="sources-panel">
+      <summary>
+        <Globe2 size={15} />
+        Web 来源
+        <span>{search.results.length ? `${search.results.length} 条` : "无结果"}</span>
+      </summary>
+      <div className="sources-query">Query: {search.query}</div>
+      {search.results.length ? (
+        <div className="source-list">
+          {search.results.map((result, index) => (
+            <a className="source-card" key={`${result.url}-${index}`} href={result.url} target="_blank" rel="noreferrer">
+              <div className="source-index">S{index + 1}</div>
+              <div className="source-content">
+                <div className="source-title">
+                  <span>{result.title}</span>
+                  <ExternalLink size={13} />
+                </div>
+                <p>{result.snippet}</p>
+                <span className="source-url">{formatSourceHost(result.url, result.engine)}</span>
+              </div>
+            </a>
+          ))}
+        </div>
+      ) : (
+        <p className="source-empty">SearXNG 没有返回结果。</p>
+      )}
+    </details>
+  );
+}
+
 export default function App() {
   const initialState = useMemo(() => loadChatState(), []);
   const [conversations, setConversations] = useState<Conversation[]>(initialState.conversations);
@@ -111,6 +155,9 @@ export default function App() {
   const [renameDraft, setRenameDraft] = useState("");
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [messageDraft, setMessageDraft] = useState("");
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+  const [webSearchIntensity, setWebSearchIntensity] = useState<WebSearchIntensity>("standard");
+  const [searching, setSearching] = useState(false);
   const [jsonPersistenceReady, setJsonPersistenceReady] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
@@ -349,7 +396,13 @@ export default function App() {
       )
     );
 
-    await requestAssistant(activeConversation.id, nextMessages, activeConversation.model);
+    await requestAssistant(
+      activeConversation.id,
+      nextMessages,
+      activeConversation.model,
+      webSearchEnabled,
+      webSearchIntensity
+    );
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -420,7 +473,13 @@ export default function App() {
       )
     );
 
-    await requestAssistant(activeConversation.id, nextMessages, activeConversation.model);
+    await requestAssistant(
+      activeConversation.id,
+      nextMessages,
+      activeConversation.model,
+      webSearchEnabled,
+      webSearchIntensity
+    );
   }
 
   async function regenerateLastReply() {
@@ -447,10 +506,16 @@ export default function App() {
       )
     );
 
-    await requestAssistant(activeConversation.id, messages, activeConversation.model);
+    await requestAssistant(activeConversation.id, messages, activeConversation.model, webSearchEnabled, webSearchIntensity);
   }
 
-  async function requestAssistant(conversationId: string, messages: ChatMessage[], model: ChatModel) {
+  async function requestAssistant(
+    conversationId: string,
+    messages: ChatMessage[],
+    model: ChatModel,
+    useWebSearch: boolean,
+    searchIntensity: WebSearchIntensity
+  ) {
     const assistantMessage: ChatMessage = {
       id: makeId(),
       role: "assistant",
@@ -459,11 +524,18 @@ export default function App() {
     };
     const controller = new AbortController();
     abortRef.current = controller;
-    setGeneration({ conversationId, messageId: assistantMessage.id });
+    setGeneration({
+      conversationId,
+      messageId: assistantMessage.id,
+      webSearchEnabled: useWebSearch,
+      webSearchIntensity: searchIntensity
+    });
+    setSearching(useWebSearch);
     appendAssistantPlaceholder(conversationId, assistantMessage);
 
     let responseText = "";
     let reasoningText = "";
+    let searchContext: WebSearchContext | undefined;
 
     try {
       const response = await fetch("/api/chat/stream", {
@@ -473,7 +545,8 @@ export default function App() {
         },
         body: JSON.stringify({
           model,
-          messages: messages.map(({ role, content }) => ({ role, content }))
+          messages: messages.map(({ role, content }) => ({ role, content })),
+          webSearch: { enabled: useWebSearch, intensity: searchIntensity }
         }),
         signal: controller.signal
       });
@@ -487,13 +560,22 @@ export default function App() {
       }
 
       await readChatStream(response.body, (event) => {
+        if (event.type === "search_results") {
+          searchContext = event.search;
+          setSearching(false);
+          updateAssistantSearch(conversationId, assistantMessage.id, event.search);
+          return;
+        }
+
         if (event.type === "reasoning") {
+          setSearching(false);
           reasoningText += event.content;
           updateAssistantMessage(conversationId, assistantMessage.id, responseText, reasoningText);
           return;
         }
 
         if (event.type === "content") {
+          setSearching(false);
           responseText += event.content;
           updateAssistantMessage(conversationId, assistantMessage.id, responseText, reasoningText);
           return;
@@ -513,9 +595,13 @@ export default function App() {
         const message = errorValue instanceof Error ? errorValue.message : "未知错误";
         setError(message);
         updateAssistantMessage(conversationId, assistantMessage.id, `请求失败：${message}`, reasoningText);
+        if (searchContext) {
+          updateAssistantSearch(conversationId, assistantMessage.id, searchContext);
+        }
       }
     } finally {
       abortRef.current = null;
+      setSearching(false);
       setGeneration(null);
     }
   }
@@ -547,6 +633,22 @@ export default function App() {
               ...conversation,
               messages: conversation.messages.map((message) =>
                 message.id === messageId ? { ...message, content, reasoningContent } : message
+              ),
+              updatedAt: nowIso()
+            }
+          : conversation
+      )
+    );
+  }
+
+  function updateAssistantSearch(conversationId: string, messageId: string, search: WebSearchContext) {
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              messages: conversation.messages.map((message) =>
+                message.id === messageId ? { ...message, search } : message
               ),
               updatedAt: nowIso()
             }
@@ -703,6 +805,7 @@ export default function App() {
                 <div className="message-body">
                   <div className="message-meta">
                     <span>{message.role === "assistant" ? "DeepSeek" : "你"}</span>
+                    {message.search ? <span>已联网</span> : null}
                     {message.editedAt ? <span>已编辑</span> : null}
                     {generation?.messageId === message.id ? <span>生成中</span> : null}
                   </div>
@@ -752,10 +855,15 @@ export default function App() {
                           </ReactMarkdown>
                         ) : (
                           <span className="typing-cursor">
-                            {message.reasoningContent ? "正在整理回答..." : "正在生成..."}
+                            {generation?.messageId === message.id && generation.webSearchEnabled && !message.search
+                              ? "正在搜索网页..."
+                              : message.reasoningContent
+                                ? "正在整理回答..."
+                                : "正在生成..."}
                           </span>
                         )}
                       </div>
+                      {message.role === "assistant" && message.search ? <SearchSources search={message.search} /> : null}
                     </>
                   )}
 
@@ -787,6 +895,33 @@ export default function App() {
 
         <footer className="composer-wrap">
           <div className="composer-tools">
+            <button
+              className={`web-toggle ${webSearchEnabled ? "is-active" : ""}`}
+              type="button"
+              onClick={() => setWebSearchEnabled((enabled) => !enabled)}
+              disabled={isGenerating}
+              title="本轮使用本地 SearXNG 搜索"
+            >
+              <Globe2 size={15} />
+              Web
+            </button>
+            {webSearchEnabled ? (
+              <div className="search-strength" aria-label="搜索强度">
+                {WEB_SEARCH_INTENSITY_OPTIONS.map((option) => (
+                  <button
+                    className={`strength-button ${webSearchIntensity === option.id ? "is-active" : ""}`}
+                    type="button"
+                    key={option.id}
+                    onClick={() => setWebSearchIntensity(option.id)}
+                    disabled={isGenerating}
+                    title={option.description}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {searching ? <span className="search-status">正在搜索 SearXNG...</span> : null}
             <button
               className="ghost-button"
               type="button"
@@ -917,12 +1052,40 @@ function handleStreamLine(line: string, onEvent: (event: StreamEvent) => void): 
     return;
   }
 
-  const parsed = JSON.parse(trimmed) as Partial<StreamEvent>;
+  const parsed = JSON.parse(trimmed) as { type?: string; content?: unknown; search?: unknown };
   if (
     (parsed.type === "reasoning" || parsed.type === "content" || parsed.type === "error") &&
     typeof parsed.content === "string"
   ) {
     onEvent({ type: parsed.type, content: parsed.content });
+    return;
+  }
+
+  if (parsed.type === "search_results" && isWebSearchContext(parsed.search)) {
+    onEvent({ type: "search_results", search: parsed.search });
+  }
+}
+
+function isWebSearchContext(value: unknown): value is WebSearchContext {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<WebSearchContext>;
+  return (
+    candidate.provider === "searxng" &&
+    typeof candidate.query === "string" &&
+    typeof candidate.searchedAt === "string" &&
+    Array.isArray(candidate.results)
+  );
+}
+
+function formatSourceHost(url: string, engine?: string): string {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "");
+    return engine ? `${host} · ${engine}` : host;
+  } catch {
+    return engine ?? url;
   }
 }
 

@@ -11,7 +11,11 @@
     "build:client": "tsc -p client/tsconfig.json && vite build --config client/vite.config.ts",
     "build:server": "tsc -p server/tsconfig.json",
     "typecheck": "tsc -p client/tsconfig.json && tsc -p server/tsconfig.json",
-    "start": "node dist/server/index.js"
+    "start": "node dist/server/index.js",
+    "search:env": "test -f searxng/.env || cp searxng/.env.example searxng/.env",
+    "search:up": "npm run search:env && docker-compose --env-file searxng/.env -f searxng/docker-compose.yml -p caster-chatbot-search up -d",
+    "search:down": "npm run search:env && docker-compose --env-file searxng/.env -f searxng/docker-compose.yml -p caster-chatbot-search down",
+    "search:logs": "npm run search:env && docker-compose --env-file searxng/.env -f searxng/docker-compose.yml -p caster-chatbot-search logs -f searxng"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",

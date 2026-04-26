@@ -3,5 +3,7 @@ node_modules/
 dist/
 .npm-cache/
 data/*.json
+searxng/.env
+searxng/cache/
 .DS_Store
 npm-debug.log*
