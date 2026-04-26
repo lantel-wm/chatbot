@@ -217,6 +217,7 @@ export default function App() {
   const [webSearchIntensity, setWebSearchIntensity] = useState<WebSearchIntensity>("standard");
   const [searching, setSearching] = useState(false);
   const [jsonPersistenceReady, setJsonPersistenceReady] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const messagesScrollRef = useRef<HTMLElement | null>(null);
@@ -322,8 +323,14 @@ export default function App() {
     shouldFollowOutputRef.current = true;
     setConversations((current) => [conversation, ...current]);
     setActiveConversationId(conversation.id);
+    setIsSidebarOpen(false);
     setDraft("");
     setError(null);
+  }
+
+  function selectConversation(conversationId: string) {
+    setActiveConversationId(conversationId);
+    setIsSidebarOpen(false);
   }
 
   function handleMessagesScroll() {
@@ -764,14 +771,14 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${isSidebarOpen ? "is-sidebar-open" : ""}`}>
       <aside className="sidebar" aria-label="会话">
         <div className="sidebar-header">
           <div className="brand">
             <span className="brand-mark">
               <Bot size={18} />
             </span>
-            <span>DeepSeek Chat</span>
+            <span>DeepSeek</span>
           </div>
           <button className="icon-button" type="button" title="新建对话" onClick={startNewConversation}>
             <Plus size={18} />
@@ -792,7 +799,7 @@ export default function App() {
               <button
                 className="conversation-main"
                 type="button"
-                onClick={() => setActiveConversationId(conversation.id)}
+                onClick={() => selectConversation(conversation.id)}
                 title={conversation.title}
               >
                 <MessageSquare size={16} />
@@ -865,11 +872,24 @@ export default function App() {
           />
         </div>
       </aside>
+      <button
+        className="sidebar-backdrop"
+        type="button"
+        aria-label="关闭会话栏"
+        onClick={() => setIsSidebarOpen(false)}
+      />
 
       <main className="chat-pane">
         <header className="topbar">
           <div className="topbar-title">
-            <PanelLeft size={18} />
+            <button
+              className="topbar-icon"
+              type="button"
+              title="打开或关闭会话栏"
+              onClick={() => setIsSidebarOpen((open) => !open)}
+            >
+              <PanelLeft size={18} />
+            </button>
             <div>
               <h1>{activeConversation?.title ?? "新对话"}</h1>
               <p>{activeConversation?.messages.length ?? 0} 条消息</p>
@@ -877,20 +897,22 @@ export default function App() {
           </div>
 
           <div className="topbar-controls">
-            <label className="model-select">
-              <span>模型</span>
-              <select
-                value={activeConversation?.model ?? DEFAULT_MODEL}
-                onChange={(event) => updateActiveModel(event.target.value as ChatModel)}
-                disabled={isGenerating}
-              >
-                {MODEL_OPTIONS.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.label} - {model.description}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="model-switcher" aria-label="模型选择">
+              {MODEL_OPTIONS.map((model) => (
+                <button
+                  className={`model-pill ${(activeConversation?.model ?? DEFAULT_MODEL) === model.id ? "is-active" : ""}`}
+                  type="button"
+                  key={model.id}
+                  onClick={() => updateActiveModel(model.id)}
+                  disabled={isGenerating}
+                  aria-pressed={(activeConversation?.model ?? DEFAULT_MODEL) === model.id}
+                  title={`${model.label} - ${model.description}`}
+                >
+                  <span className="model-pill-label">{model.label}</span>
+                  <span className="model-pill-desc">{model.description}</span>
+                </button>
+              ))}
+            </div>
           </div>
         </header>
 
@@ -1002,64 +1024,66 @@ export default function App() {
         </section>
 
         <footer className="composer-wrap">
-          <div className="composer-tools">
-            <ContextHud summary={tokenSummary} />
-            <button
-              className={`web-toggle ${webSearchEnabled ? "is-active" : ""}`}
-              type="button"
-              onClick={() => setWebSearchEnabled((enabled) => !enabled)}
-              disabled={isGenerating}
-              title="本轮使用本地 SearXNG 搜索"
-            >
-              <Globe2 size={15} />
-              Web
-            </button>
-            {webSearchEnabled ? (
-              <div className="search-strength" aria-label="搜索强度">
-                {WEB_SEARCH_INTENSITY_OPTIONS.map((option) => (
-                  <button
-                    className={`strength-button ${webSearchIntensity === option.id ? "is-active" : ""}`}
-                    type="button"
-                    key={option.id}
-                    onClick={() => setWebSearchIntensity(option.id)}
-                    disabled={isGenerating}
-                    title={option.description}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-            ) : null}
-            {searching ? <span className="search-status">正在搜索 SearXNG...</span> : null}
-            <button
-              className="ghost-button"
-              type="button"
-              onClick={() => void regenerateLastReply()}
-              disabled={isGenerating || !canRegenerate(activeConversation)}
-            >
-              <RefreshCw size={15} />
-              重新生成
-            </button>
+          <div className="composer-panel">
+            <div className="composer-tools">
+              <ContextHud summary={tokenSummary} />
+              <button
+                className={`web-toggle ${webSearchEnabled ? "is-active" : ""}`}
+                type="button"
+                onClick={() => setWebSearchEnabled((enabled) => !enabled)}
+                disabled={isGenerating}
+                title="本轮使用本地 SearXNG 搜索"
+              >
+                <Globe2 size={15} />
+                Web
+              </button>
+              {webSearchEnabled ? (
+                <div className="search-strength" aria-label="搜索强度">
+                  {WEB_SEARCH_INTENSITY_OPTIONS.map((option) => (
+                    <button
+                      className={`strength-button ${webSearchIntensity === option.id ? "is-active" : ""}`}
+                      type="button"
+                      key={option.id}
+                      onClick={() => setWebSearchIntensity(option.id)}
+                      disabled={isGenerating}
+                      title={option.description}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              {searching ? <span className="search-status">正在搜索 SearXNG...</span> : null}
+              <button
+                className="ghost-button"
+                type="button"
+                onClick={() => void regenerateLastReply()}
+                disabled={isGenerating || !canRegenerate(activeConversation)}
+              >
+                <RefreshCw size={15} />
+                重新生成
+              </button>
+            </div>
+            <form className="composer" onSubmit={(event) => void submitMessage(event)}>
+              <textarea
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={handleComposerKeyDown}
+                placeholder="给 DeepSeek 发送消息"
+                rows={1}
+                disabled={isGenerating}
+              />
+              {isGenerating ? (
+                <button className="send-button stop" type="button" title="停止生成" onClick={stopGeneration}>
+                  <Square size={18} />
+                </button>
+              ) : (
+                <button className="send-button" type="submit" title="发送" disabled={!draft.trim()}>
+                  <Send size={18} />
+                </button>
+              )}
+            </form>
           </div>
-          <form className="composer" onSubmit={(event) => void submitMessage(event)}>
-            <textarea
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={handleComposerKeyDown}
-              placeholder="给 DeepSeek 发送消息"
-              rows={1}
-              disabled={isGenerating}
-            />
-            {isGenerating ? (
-              <button className="send-button stop" type="button" title="停止生成" onClick={stopGeneration}>
-                <Square size={18} />
-              </button>
-            ) : (
-              <button className="send-button" type="submit" title="发送" disabled={!draft.trim()}>
-                <Send size={18} />
-              </button>
-            )}
-          </form>
         </footer>
       </main>
     </div>
