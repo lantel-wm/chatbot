@@ -16,12 +16,22 @@ export interface WebSearchContext {
   results: WebSearchResult[];
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+  promptCacheHitTokens?: number;
+  promptCacheMissTokens?: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
   content: string;
   reasoningContent?: string;
   search?: WebSearchContext;
+  usage?: TokenUsage;
   createdAt: string;
   editedAt?: string;
 }

@@ -1,4 +1,4 @@
-import { DEFAULT_MODEL, type Conversation, type StoredChatState } from "./types";
+import { DEFAULT_MODEL, type Conversation, type StoredChatState, type TokenUsage } from "./types";
 
 const STORAGE_KEY = "caster.deepseek.chatbot.v1";
 
@@ -93,7 +93,41 @@ export function normalizeStoredChatState(state: StoredChatState): StoredChatStat
 
   return {
     activeConversationId,
-    conversations
+    conversations: conversations.map((conversation) => ({
+      ...conversation,
+      messages: Array.isArray(conversation.messages)
+        ? conversation.messages.map((message) => ({
+            ...message,
+            usage: normalizeTokenUsage(message.usage)
+          }))
+        : []
+    }))
+  };
+}
+
+function normalizeTokenUsage(value: unknown): TokenUsage | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const candidate = value as Partial<TokenUsage>;
+  if (
+    typeof candidate.promptTokens !== "number" ||
+    typeof candidate.completionTokens !== "number" ||
+    typeof candidate.totalTokens !== "number"
+  ) {
+    return undefined;
+  }
+
+  return {
+    promptTokens: candidate.promptTokens,
+    completionTokens: candidate.completionTokens,
+    totalTokens: candidate.totalTokens,
+    reasoningTokens: typeof candidate.reasoningTokens === "number" ? candidate.reasoningTokens : undefined,
+    promptCacheHitTokens:
+      typeof candidate.promptCacheHitTokens === "number" ? candidate.promptCacheHitTokens : undefined,
+    promptCacheMissTokens:
+      typeof candidate.promptCacheMissTokens === "number" ? candidate.promptCacheMissTokens : undefined
   };
 }
 

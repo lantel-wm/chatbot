@@ -36,6 +36,7 @@ import {
   type ChatModel,
   type Conversation,
   type StoredChatState,
+  type TokenUsage,
   type WebSearchContext,
   type WebSearchIntensity
 } from "./types";
@@ -63,9 +64,23 @@ type StreamEvent =
       content: string;
     }
   | {
+      type: "usage";
+      usage: TokenUsage;
+    }
+  | {
       type: "search_results";
       search: WebSearchContext;
     };
+
+const DEEPSEEK_CONTEXT_TOKENS = 1_000_000;
+const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 160;
+
+interface TokenSummary {
+  estimatedContextTokens: number;
+  remainingContextTokens: number;
+  contextLimitTokens: number;
+  lastUsage?: TokenUsage;
+}
 
 const markdownComponents: Components = {
   a({ children, ...props }) {
@@ -144,6 +159,49 @@ function SearchSources({ search }: { search: WebSearchContext }) {
   );
 }
 
+function ContextHud({ summary }: { summary: TokenSummary }) {
+  const usedPercent = getContextUsagePercent(summary);
+  const tone = getContextUsageTone(usedPercent);
+
+  return (
+    <div
+      className={`context-hud ${tone}`}
+      title="当前上下文为本地估算，不包含历史思考过程；最近请求来自 DeepSeek usage，CoT/reasoning token 计入最近请求输出。"
+    >
+      <div className="context-hud-row">
+        <span className="context-hud-label">上下文</span>
+        <span>已用 ≈ {formatTokenCount(summary.estimatedContextTokens)}</span>
+        <span>剩余 ≈ {formatTokenCount(summary.remainingContextTokens)}</span>
+      </div>
+      <div
+        className="context-progress"
+        role="meter"
+        aria-label="上下文使用量"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(usedPercent)}
+      >
+        <span className="context-progress-fill" style={{ width: `${usedPercent}%` }} />
+      </div>
+      <div className="context-hud-foot">
+        {summary.lastUsage ? (
+          <span>
+            上次 {formatTokenCount(summary.lastUsage.totalTokens)} · 入{" "}
+            {formatTokenCount(summary.lastUsage.promptTokens)} / 出{" "}
+            {formatTokenCount(summary.lastUsage.completionTokens)}
+            {summary.lastUsage.reasoningTokens
+              ? ` / CoT ${formatTokenCount(summary.lastUsage.reasoningTokens)}`
+              : ""}
+          </span>
+        ) : (
+          <span>上次暂无官方用量</span>
+        )}
+        <span>{Math.round(usedPercent)}%</span>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const initialState = useMemo(() => loadChatState(), []);
   const [conversations, setConversations] = useState<Conversation[]>(initialState.conversations);
@@ -161,7 +219,9 @@ export default function App() {
   const [jsonPersistenceReady, setJsonPersistenceReady] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const messagesScrollRef = useRef<HTMLElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const shouldFollowOutputRef = useRef(true);
 
   const activeConversation =
     conversations.find((conversation) => conversation.id === activeConversationId) ?? conversations[0];
@@ -175,6 +235,7 @@ export default function App() {
   );
 
   const isGenerating = generation !== null;
+  const tokenSummary = useMemo(() => buildTokenSummary(activeConversation), [activeConversation]);
 
   useEffect(() => {
     let cancelled = false;
@@ -237,8 +298,17 @@ export default function App() {
   }, [activeConversation, conversations]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [activeConversation?.messages, generation]);
+    shouldFollowOutputRef.current = true;
+    window.requestAnimationFrame(() => scrollMessagesToBottom("auto"));
+  }, [activeConversationId]);
+
+  useEffect(() => {
+    if (!shouldFollowOutputRef.current) {
+      return;
+    }
+
+    window.requestAnimationFrame(() => scrollMessagesToBottom(isGenerating ? "auto" : "smooth"));
+  }, [activeConversation?.messages, isGenerating]);
 
   useEffect(() => {
     return () => {
@@ -249,10 +319,24 @@ export default function App() {
   function startNewConversation() {
     const conversation = createConversation();
     conversation.model = activeConversation?.model ?? DEFAULT_MODEL;
+    shouldFollowOutputRef.current = true;
     setConversations((current) => [conversation, ...current]);
     setActiveConversationId(conversation.id);
     setDraft("");
     setError(null);
+  }
+
+  function handleMessagesScroll() {
+    const element = messagesScrollRef.current;
+    if (!element) {
+      return;
+    }
+
+    shouldFollowOutputRef.current = isScrolledNearBottom(element);
+  }
+
+  function scrollMessagesToBottom(behavior: ScrollBehavior) {
+    messagesEndRef.current?.scrollIntoView({ behavior, block: "end" });
   }
 
   function deleteConversation(conversationId: string) {
@@ -406,7 +490,7 @@ export default function App() {
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (event.key === "Enter" && event.ctrlKey) {
       event.preventDefault();
       void submitMessage();
     }
@@ -524,6 +608,7 @@ export default function App() {
     };
     const controller = new AbortController();
     abortRef.current = controller;
+    shouldFollowOutputRef.current = true;
     setGeneration({
       conversationId,
       messageId: assistantMessage.id,
@@ -578,6 +663,11 @@ export default function App() {
           setSearching(false);
           responseText += event.content;
           updateAssistantMessage(conversationId, assistantMessage.id, responseText, reasoningText);
+          return;
+        }
+
+        if (event.type === "usage") {
+          updateAssistantUsage(conversationId, assistantMessage.id, event.usage);
           return;
         }
 
@@ -649,6 +739,22 @@ export default function App() {
               ...conversation,
               messages: conversation.messages.map((message) =>
                 message.id === messageId ? { ...message, search } : message
+              ),
+              updatedAt: nowIso()
+            }
+          : conversation
+      )
+    );
+  }
+
+  function updateAssistantUsage(conversationId: string, messageId: string, usage: TokenUsage) {
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              messages: conversation.messages.map((message) =>
+                message.id === messageId ? { ...message, usage } : message
               ),
               updatedAt: nowIso()
             }
@@ -770,20 +876,22 @@ export default function App() {
             </div>
           </div>
 
-          <label className="model-select">
-            <span>模型</span>
-            <select
-              value={activeConversation?.model ?? DEFAULT_MODEL}
-              onChange={(event) => updateActiveModel(event.target.value as ChatModel)}
-              disabled={isGenerating}
-            >
-              {MODEL_OPTIONS.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.label} - {model.description}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="topbar-controls">
+            <label className="model-select">
+              <span>模型</span>
+              <select
+                value={activeConversation?.model ?? DEFAULT_MODEL}
+                onChange={(event) => updateActiveModel(event.target.value as ChatModel)}
+                disabled={isGenerating}
+              >
+                {MODEL_OPTIONS.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.label} - {model.description}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
         </header>
 
         {error ? (
@@ -795,7 +903,7 @@ export default function App() {
           </div>
         ) : null}
 
-        <section className="messages" aria-live="polite">
+        <section className="messages" aria-live="polite" ref={messagesScrollRef} onScroll={handleMessagesScroll}>
           {activeConversation?.messages.length ? (
             activeConversation.messages.map((message) => (
               <article className={`message ${message.role}`} key={message.id}>
@@ -895,6 +1003,7 @@ export default function App() {
 
         <footer className="composer-wrap">
           <div className="composer-tools">
+            <ContextHud summary={tokenSummary} />
             <button
               className={`web-toggle ${webSearchEnabled ? "is-active" : ""}`}
               type="button"
@@ -975,6 +1084,96 @@ function canRegenerate(conversation?: Conversation): boolean {
   return Boolean(messages.length && messages[messages.length - 1].role === "user");
 }
 
+function buildTokenSummary(conversation?: Conversation): TokenSummary {
+  const estimatedContextTokens = estimateConversationContextTokens(conversation);
+  return {
+    estimatedContextTokens,
+    remainingContextTokens: Math.max(0, DEEPSEEK_CONTEXT_TOKENS - estimatedContextTokens),
+    contextLimitTokens: DEEPSEEK_CONTEXT_TOKENS,
+    lastUsage: findLastTokenUsage(conversation)
+  };
+}
+
+function findLastTokenUsage(conversation?: Conversation): TokenUsage | undefined {
+  if (!conversation) {
+    return undefined;
+  }
+
+  for (let index = conversation.messages.length - 1; index >= 0; index -= 1) {
+    const usage = conversation.messages[index].usage;
+    if (usage) {
+      return usage;
+    }
+  }
+  return undefined;
+}
+
+function estimateConversationContextTokens(conversation?: Conversation): number {
+  if (!conversation) {
+    return 0;
+  }
+
+  return conversation.messages.reduce((total, message) => {
+    // The backend sends role/content only for chat history. Reasoning text and source cards are not resent next turn.
+    return total + 4 + estimateTextTokens(message.role) + estimateTextTokens(message.content);
+  }, 3);
+}
+
+function estimateTextTokens(value: string): number {
+  let tokens = 0;
+  let asciiRunLength = 0;
+
+  for (const char of value) {
+    if (/[\x00-\x7F]/.test(char)) {
+      asciiRunLength += 1;
+      continue;
+    }
+
+    if (asciiRunLength) {
+      tokens += Math.ceil(asciiRunLength / 4);
+      asciiRunLength = 0;
+    }
+    tokens += /\s/.test(char) ? 0 : 1;
+  }
+
+  if (asciiRunLength) {
+    tokens += Math.ceil(asciiRunLength / 4);
+  }
+
+  return tokens;
+}
+
+function formatTokenCount(value: number): string {
+  if (value >= 1_000_000) {
+    return `${trimNumber(value / 1_000_000)}M`;
+  }
+  if (value >= 1_000) {
+    return `${trimNumber(value / 1_000)}K`;
+  }
+  return String(Math.round(value));
+}
+
+function trimNumber(value: number): string {
+  return value >= 10 ? value.toFixed(0) : value.toFixed(1).replace(/\.0$/, "");
+}
+
+function getContextUsagePercent(summary: TokenSummary): number {
+  if (!summary.contextLimitTokens) {
+    return 0;
+  }
+  return Math.min(100, Math.max(0, (summary.estimatedContextTokens / summary.contextLimitTokens) * 100));
+}
+
+function getContextUsageTone(percent: number): "is-calm" | "is-warn" | "is-danger" {
+  if (percent >= 90) {
+    return "is-danger";
+  }
+  if (percent >= 70) {
+    return "is-warn";
+  }
+  return "is-calm";
+}
+
 function normalizeImportedConversations(value: Partial<StoredChatState>): Conversation[] {
   if (!Array.isArray(value.conversations)) {
     return [];
@@ -1052,7 +1251,7 @@ function handleStreamLine(line: string, onEvent: (event: StreamEvent) => void): 
     return;
   }
 
-  const parsed = JSON.parse(trimmed) as { type?: string; content?: unknown; search?: unknown };
+  const parsed = JSON.parse(trimmed) as { type?: string; content?: unknown; search?: unknown; usage?: unknown };
   if (
     (parsed.type === "reasoning" || parsed.type === "content" || parsed.type === "error") &&
     typeof parsed.content === "string"
@@ -1063,6 +1262,11 @@ function handleStreamLine(line: string, onEvent: (event: StreamEvent) => void): 
 
   if (parsed.type === "search_results" && isWebSearchContext(parsed.search)) {
     onEvent({ type: "search_results", search: parsed.search });
+    return;
+  }
+
+  if (parsed.type === "usage" && isTokenUsage(parsed.usage)) {
+    onEvent({ type: "usage", usage: parsed.usage });
   }
 }
 
@@ -1078,6 +1282,24 @@ function isWebSearchContext(value: unknown): value is WebSearchContext {
     typeof candidate.searchedAt === "string" &&
     Array.isArray(candidate.results)
   );
+}
+
+function isTokenUsage(value: unknown): value is TokenUsage {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<TokenUsage>;
+  return (
+    typeof candidate.promptTokens === "number" &&
+    typeof candidate.completionTokens === "number" &&
+    typeof candidate.totalTokens === "number"
+  );
+}
+
+function isScrolledNearBottom(element: HTMLElement): boolean {
+  const distanceToBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
+  return distanceToBottom <= AUTO_SCROLL_BOTTOM_THRESHOLD_PX;
 }
 
 function formatSourceHost(url: string, engine?: string): string {

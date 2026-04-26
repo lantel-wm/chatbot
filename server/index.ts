@@ -75,6 +75,7 @@ interface StoredMessage {
   content: string;
   reasoningContent?: string;
   search?: WebSearchContext;
+  usage?: TokenUsage;
   createdAt: string;
   editedAt?: string;
 }
@@ -119,6 +120,26 @@ interface WebSearchContext {
   query: string;
   searchedAt: string;
   results: WebSearchResult[];
+}
+
+interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+  promptCacheHitTokens?: number;
+  promptCacheMissTokens?: number;
+}
+
+interface DeepseekUsage {
+  prompt_tokens?: unknown;
+  completion_tokens?: unknown;
+  total_tokens?: unknown;
+  completion_tokens_details?: {
+    reasoning_tokens?: unknown;
+  };
+  prompt_cache_hit_tokens?: unknown;
+  prompt_cache_miss_tokens?: unknown;
 }
 
 interface WebSearchLimits {
@@ -259,7 +280,8 @@ app.post("/api/chat/stream", async (req: Request<object, object, ChatRequestBody
     const requestBody: Record<string, unknown> = {
       model: chatModel,
       messages: normalizedMessages,
-      stream: true
+      stream: true,
+      stream_options: { include_usage: true }
     };
 
     if (chatModel === "deepseek-v4-pro") {
@@ -462,8 +484,35 @@ function normalizeStoredMessage(value: unknown): StoredMessage | null {
     content: candidate.content,
     reasoningContent: typeof candidate.reasoningContent === "string" ? candidate.reasoningContent : undefined,
     search: normalizeWebSearchContext(candidate.search),
+    usage: normalizeTokenUsage(candidate.usage),
     createdAt: candidate.createdAt,
     editedAt: typeof candidate.editedAt === "string" ? candidate.editedAt : undefined
+  };
+}
+
+function normalizeTokenUsage(value: unknown): TokenUsage | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const candidate = value as Partial<TokenUsage>;
+  if (
+    typeof candidate.promptTokens !== "number" ||
+    typeof candidate.completionTokens !== "number" ||
+    typeof candidate.totalTokens !== "number"
+  ) {
+    return undefined;
+  }
+
+  return {
+    promptTokens: candidate.promptTokens,
+    completionTokens: candidate.completionTokens,
+    totalTokens: candidate.totalTokens,
+    reasoningTokens: typeof candidate.reasoningTokens === "number" ? candidate.reasoningTokens : undefined,
+    promptCacheHitTokens:
+      typeof candidate.promptCacheHitTokens === "number" ? candidate.promptCacheHitTokens : undefined,
+    promptCacheMissTokens:
+      typeof candidate.promptCacheMissTokens === "number" ? candidate.promptCacheMissTokens : undefined
   };
 }
 
@@ -749,7 +798,8 @@ async function streamWebSearchFinalAnswer(
   const requestBody: Record<string, unknown> = {
     model,
     messages: buildWebSearchFinalAnswerMessages(messages, search, limits, limitReached),
-    stream: true
+    stream: true,
+    stream_options: { include_usage: true }
   };
 
   if (model === "deepseek-v4-pro") {
@@ -1266,11 +1316,16 @@ function writeDeepseekLine(line: string, res: Response): boolean {
 
   try {
     const parsed = JSON.parse(payload) as {
+      usage?: DeepseekUsage | null;
       choices?: Array<{
         delta?: { reasoning_content?: string; content?: string };
         message?: { reasoning_content?: string; content?: string };
       }>;
     };
+    const usage = normalizeDeepseekUsage(parsed.usage);
+    if (usage) {
+      writeStreamEvent(res, { type: "usage", usage });
+    }
     const reasoningContent =
       parsed.choices?.[0]?.delta?.reasoning_content ?? parsed.choices?.[0]?.message?.reasoning_content ?? "";
     const content = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.message?.content ?? "";
@@ -1291,9 +1346,36 @@ function writeStreamEvent(
   res: Response,
   event:
     | { type: "reasoning" | "content" | "error"; content: string }
+    | { type: "usage"; usage: TokenUsage }
     | { type: "search_results"; search: WebSearchContext }
 ): void {
   res.write(`${JSON.stringify(event)}\n`);
+}
+
+function normalizeDeepseekUsage(value: DeepseekUsage | null | undefined): TokenUsage | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const promptTokens = readUsageNumber(value.prompt_tokens);
+  const completionTokens = readUsageNumber(value.completion_tokens);
+  const totalTokens = readUsageNumber(value.total_tokens);
+  if (promptTokens === undefined || completionTokens === undefined || totalTokens === undefined) {
+    return undefined;
+  }
+
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    reasoningTokens: readUsageNumber(value.completion_tokens_details?.reasoning_tokens),
+    promptCacheHitTokens: readUsageNumber(value.prompt_cache_hit_tokens),
+    promptCacheMissTokens: readUsageNumber(value.prompt_cache_miss_tokens)
+  };
+}
+
+function readUsageNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function buildDeepseekError(status: number, detail: string): string {
