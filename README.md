@@ -5,7 +5,6 @@
 ## 运行
 
 ```bash
-cd /Users/zhaozhiyu/Projects/caster/chatbot
 npm install
 cp .env.example .env
 ```
@@ -74,7 +73,7 @@ http://127.0.0.1:5173
 对话历史会自动保存到：
 
 ```text
-/Users/zhaozhiyu/Projects/caster/chatbot/data/chat-history.json
+data/chat-history.json
 ```
 
 浏览器 `localStorage` 只作为缓存和旧数据迁移兜底使用。
