@@ -50,16 +50,21 @@ export interface StoredChatState {
   conversations: Conversation[];
 }
 
-export const MODEL_OPTIONS: Array<{ id: ChatModel; label: string; description: string }> = [
+export interface ChatModelMetadata {
+  id: ChatModel;
+  object: string;
+  ownedBy: string;
+  contextLengthTokens: number;
+}
+
+export const MODEL_OPTIONS: Array<{ id: ChatModel; label: string }> = [
   {
     id: "deepseek-v4-flash",
-    label: "V4 Flash",
-    description: "快速、经济"
+    label: "deepseek-v4-flash"
   },
   {
     id: "deepseek-v4-pro",
-    label: "V4 Pro",
-    description: "更强推理"
+    label: "deepseek-v4-pro"
   }
 ];
 
@@ -70,7 +75,7 @@ export const WEB_SEARCH_INTENSITY_OPTIONS: Array<{
 }> = [
   {
     id: "light",
-    label: "轻",
+    label: "低",
     description: "最多 2 次搜索"
   },
   {
@@ -80,7 +85,7 @@ export const WEB_SEARCH_INTENSITY_OPTIONS: Array<{
   },
   {
     id: "deep",
-    label: "深",
+    label: "高",
     description: "不限制搜索次数"
   }
 ];

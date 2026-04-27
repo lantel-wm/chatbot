@@ -14,12 +14,19 @@ cp .env.example .env
 
 ```bash
 DEEPSEEK_API_KEY=sk-...
+DEEPSEEK_CONTEXT_TOKENS=1000000
 PORT=3001
 CHATBOT_DATA_FILE=data/chat-history.json
 SEARXNG_BASE_URL=http://127.0.0.1:8888
+SEARXNG_ENGINE_CANDIDATES=bing,qwant,mojeek,wikipedia,reuters,wikinews,brave,duckduckgo,startpage,google
+SEARXNG_ENGINE_PROBE_QUERY=OpenAI
+SEARXNG_ENGINE_PROBE_TTL_MS=600000
 WEB_SEARCH_MAX_RESULTS=5
 WEB_SEARCH_TIMEOUT_MS=8000
+WEB_SEARCH_DELAY_MS=1500
 ```
+
+前端上下文百分比来自后端 `/api/models`。后端会先读取 DeepSeek `/models`；当前官方接口只返回模型基础信息时，使用 `.env` 中的 `DEEPSEEK_CONTEXT_TOKENS`，或 `DEEPSEEK_V4_FLASH_CONTEXT_TOKENS` / `DEEPSEEK_V4_PRO_CONTEXT_TOKENS` 覆盖。
 
 ## 本地 Web Search
 
@@ -36,6 +43,8 @@ curl 'http://127.0.0.1:8888/search?q=test&format=json'
 curl http://127.0.0.1:3001/api/search/health
 ```
 
+`SEARXNG_ENGINE_CANDIDATES` 是探测候选池，不是固定使用的引擎列表。后端会在执行 Web Search 前逐个探测候选引擎，把当前可用的引擎动态传给 SearXNG；探测结果按 `SEARXNG_ENGINE_PROBE_TTL_MS` 缓存，避免每一轮都探测。也可以把候选值设为 `auto`，让后端从 SearXNG `/config` 发现候选引擎。`WEB_SEARCH_DELAY_MS` 是后端对所有 SearXNG 请求的全局串行节流间隔，默认 1500ms，用于降低连续搜索触发上游限流的概率。
+
 停止搜索服务：
 
 ```bash
@@ -48,7 +57,7 @@ npm run search:down
 cp searxng/.env.example searxng/.env
 ```
 
-页面输入框上方的 `Web` 开关只影响当前发送或重新生成的一轮。开启后，后端会先让 DeepSeek 按 tool calling 协议调用 `web_search` 工具，由模型生成搜索 query；本地 SearXNG 执行检索后再把工具结果回传给 DeepSeek，直到模型给出最终回答。`轻 / 中 / 深` 三档分别限制最多 2 / 6 / 不限次数的实际搜索；达到有限强度上限时会基于已有来源收口，不再直接报错。聊天记录只保存搜索 query、来源标题、链接和摘要。
+页面输入框上方的 `Web` 开关只影响当前发送或重新生成的一轮。开启后，后端会先让 DeepSeek 按 tool calling 协议调用 `web_search` 工具，由模型生成搜索 query；本地 SearXNG 执行检索后再把工具结果回传给 DeepSeek，直到模型给出最终回答。前端固定使用高强度搜索，不限制实际搜索次数；聊天记录只保存搜索 query、来源标题、链接和摘要。
 
 启动：
 

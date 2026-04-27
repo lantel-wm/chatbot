@@ -1,5 +1,6 @@
 import {
   Bot,
+  BrainCircuit,
   Check,
   Copy,
   Download,
@@ -14,9 +15,11 @@ import {
   Square,
   Trash2,
   Upload,
+  User,
   X
 } from "lucide-react";
 import {
+  memo,
   useEffect,
   useMemo,
   useRef,
@@ -31,7 +34,7 @@ import remarkGfm from "remark-gfm";
 import {
   DEFAULT_MODEL,
   MODEL_OPTIONS,
-  WEB_SEARCH_INTENSITY_OPTIONS,
+  type ChatModelMetadata,
   type ChatMessage,
   type ChatModel,
   type Conversation,
@@ -56,6 +59,7 @@ interface GenerationState {
   messageId: string;
   webSearchEnabled: boolean;
   webSearchIntensity: WebSearchIntensity;
+  deepThinkingEnabled: boolean;
 }
 
 type StreamEvent =
@@ -70,19 +74,76 @@ type StreamEvent =
   | {
       type: "search_results";
       search: WebSearchContext;
+    }
+  | {
+      type: "search_status";
+      status: "searching";
     };
 
-const DEEPSEEK_CONTEXT_TOKENS = 1_000_000;
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 160;
 
 interface TokenSummary {
   estimatedContextTokens: number;
-  remainingContextTokens: number;
   contextLimitTokens: number;
-  lastUsage?: TokenUsage;
 }
 
-const markdownComponents: Components = {
+interface ComposerInputProps {
+  resetKey: string;
+  isGenerating: boolean;
+  onSubmitMessage: (content: string) => void | Promise<void>;
+  onStopGeneration: () => void;
+}
+
+function buildMarkdownComponents(search?: WebSearchContext): Components {
+  const sourceUrls = new Set(search?.results.map((result) => result.url) ?? []);
+
+  return {
+    a({ children, className, href, ...props }) {
+      const text = extractText(children).trim();
+      const isCitation = Boolean(href && sourceUrls.has(href) && /^\[\d+\]$/.test(text));
+      const mergedClassName = [className, isCitation ? "citation-link" : ""].filter(Boolean).join(" ") || undefined;
+      const sourceTitle = isCitation && href ? getSourceTitleByUrl(search, href) : undefined;
+
+      return (
+        <a
+          {...props}
+          className={mergedClassName}
+          href={href}
+          target="_blank"
+          rel="noreferrer"
+          title={sourceTitle ?? props.title}
+        >
+          {children}
+        </a>
+      );
+    },
+    pre({ children }) {
+      return <CodeBlock>{children}</CodeBlock>;
+    },
+    code({ children, className, ...props }) {
+      return (
+        <code className={className ? `markdown-code ${className}` : "markdown-code"} {...props}>
+          {children}
+        </code>
+      );
+    }
+  };
+}
+
+const markdownComponents = buildMarkdownComponents();
+
+function MarkdownContent({ content, search }: { content: string; search?: WebSearchContext }) {
+  const components = useMemo(() => buildMarkdownComponents(search), [search]);
+  const linkedContent = useMemo(() => linkifySearchCitations(content, search), [content, search]);
+
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]} components={components}>
+      {linkedContent}
+    </ReactMarkdown>
+  );
+}
+
+const reasoningMarkdownComponents: Components = {
   a({ children, ...props }) {
     return (
       <a {...props} target="_blank" rel="noreferrer">
@@ -90,16 +151,7 @@ const markdownComponents: Components = {
       </a>
     );
   },
-  pre({ children }) {
-    return <CodeBlock>{children}</CodeBlock>;
-  },
-  code({ children, className, ...props }) {
-    return (
-      <code className={className ? `markdown-code ${className}` : "markdown-code"} {...props}>
-        {children}
-      </code>
-    );
-  }
+  ...markdownComponents
 };
 
 function CodeBlock({ children }: { children: ReactNode }) {
@@ -140,7 +192,7 @@ function SearchSources({ search }: { search: WebSearchContext }) {
         <div className="source-list">
           {search.results.map((result, index) => (
             <a className="source-card" key={`${result.url}-${index}`} href={result.url} target="_blank" rel="noreferrer">
-              <div className="source-index">S{index + 1}</div>
+              <div className="source-index">{index + 1}</div>
               <div className="source-content">
                 <div className="source-title">
                   <span>{result.title}</span>
@@ -162,51 +214,82 @@ function SearchSources({ search }: { search: WebSearchContext }) {
 function ContextHud({ summary }: { summary: TokenSummary }) {
   const usedPercent = getContextUsagePercent(summary);
   const tone = getContextUsageTone(usedPercent);
+  const roundedPercent = Math.round(usedPercent);
 
   return (
     <div
       className={`context-hud ${tone}`}
-      title="当前上下文为本地估算，不包含历史思考过程；最近请求来自 DeepSeek usage，CoT/reasoning token 计入最近请求输出。"
+      title="当前上下文为本地估算，不包含历史思考过程；单次回复用量显示在对应回复上。"
+      aria-label="上下文使用量"
     >
-      <div className="context-hud-row">
-        <span className="context-hud-label">上下文</span>
-        <span>已用 ≈ {formatTokenCount(summary.estimatedContextTokens)}</span>
-        <span>剩余 ≈ {formatTokenCount(summary.remainingContextTokens)}</span>
-      </div>
-      <div
-        className="context-progress"
-        role="meter"
-        aria-label="上下文使用量"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={Math.round(usedPercent)}
-      >
-        <span className="context-progress-fill" style={{ width: `${usedPercent}%` }} />
-      </div>
-      <div className="context-hud-foot">
-        {summary.lastUsage ? (
-          <span>
-            上次 {formatTokenCount(summary.lastUsage.totalTokens)} · 入{" "}
-            {formatTokenCount(summary.lastUsage.promptTokens)} / 出{" "}
-            {formatTokenCount(summary.lastUsage.completionTokens)}
-            {summary.lastUsage.reasoningTokens
-              ? ` / CoT ${formatTokenCount(summary.lastUsage.reasoningTokens)}`
-              : ""}
-          </span>
-        ) : (
-          <span>上次暂无官方用量</span>
-        )}
-        <span>{Math.round(usedPercent)}%</span>
-      </div>
+      <span
+        className="context-hud-ring"
+        aria-hidden="true"
+        style={{ "--context-used": `${Math.max(1, roundedPercent)}%` } as React.CSSProperties}
+      />
+      <span className="context-hud-label">上下文</span>
+      <span className="context-hud-value">{roundedPercent}%</span>
     </div>
   );
 }
+
+const ComposerInput = memo(function ComposerInput({
+  resetKey,
+  isGenerating,
+  onSubmitMessage,
+  onStopGeneration
+}: ComposerInputProps) {
+  const [draft, setDraft] = useState("");
+
+  useEffect(() => {
+    setDraft("");
+  }, [resetKey]);
+
+  function submitDraft(event?: FormEvent) {
+    event?.preventDefault();
+    const content = draft.trim();
+    if (!content || isGenerating) {
+      return;
+    }
+
+    setDraft("");
+    void onSubmitMessage(content);
+  }
+
+  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && event.ctrlKey) {
+      event.preventDefault();
+      submitDraft();
+    }
+  }
+
+  return (
+    <form className="composer" onSubmit={submitDraft}>
+      <textarea
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={handleKeyDown}
+        placeholder="给 Chatbot 发送消息"
+        rows={1}
+        disabled={isGenerating}
+      />
+      {isGenerating ? (
+        <button className="send-button stop" type="button" title="停止生成" onClick={onStopGeneration}>
+          <Square size={18} />
+        </button>
+      ) : (
+        <button className="send-button" type="submit" title="发送" disabled={!draft.trim()}>
+          <Send size={18} />
+        </button>
+      )}
+    </form>
+  );
+});
 
 export default function App() {
   const initialState = useMemo(() => loadChatState(), []);
   const [conversations, setConversations] = useState<Conversation[]>(initialState.conversations);
   const [activeConversationId, setActiveConversationId] = useState(initialState.activeConversationId);
-  const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [generation, setGeneration] = useState<GenerationState | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -214,14 +297,15 @@ export default function App() {
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [messageDraft, setMessageDraft] = useState("");
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
-  const [webSearchIntensity, setWebSearchIntensity] = useState<WebSearchIntensity>("standard");
+  const [deepThinkingEnabled, setDeepThinkingEnabled] = useState(true);
+  const [modelMetadata, setModelMetadata] = useState<ChatModelMetadata[]>([]);
   const [searching, setSearching] = useState(false);
   const [jsonPersistenceReady, setJsonPersistenceReady] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const messagesScrollRef = useRef<HTMLElement | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const shouldFollowOutputRef = useRef(true);
 
   const activeConversation =
@@ -236,7 +320,36 @@ export default function App() {
   );
 
   const isGenerating = generation !== null;
-  const tokenSummary = useMemo(() => buildTokenSummary(activeConversation), [activeConversation]);
+  const activeContextLimitTokens = getModelContextLimitTokens(modelMetadata, activeConversation?.model);
+  const tokenSummary = useMemo(
+    () => buildTokenSummary(activeConversation, activeContextLimitTokens),
+    [activeConversation, activeContextLimitTokens]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadModelMetadata() {
+      try {
+        const response = await fetch("/api/models");
+        if (!response.ok) {
+          throw new Error(await readErrorResponse(response));
+        }
+        const metadata = normalizeModelMetadataResponse(await response.json());
+        if (!cancelled) {
+          setModelMetadata(metadata);
+        }
+      } catch (errorValue) {
+        const message = errorValue instanceof Error ? errorValue.message : "读取模型信息失败。";
+        console.warn(message);
+      }
+    }
+
+    void loadModelMetadata();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -324,13 +437,21 @@ export default function App() {
     setConversations((current) => [conversation, ...current]);
     setActiveConversationId(conversation.id);
     setIsSidebarOpen(false);
-    setDraft("");
     setError(null);
   }
 
   function selectConversation(conversationId: string) {
     setActiveConversationId(conversationId);
     setIsSidebarOpen(false);
+  }
+
+  function toggleSidebar() {
+    if (window.matchMedia("(max-width: 640px)").matches) {
+      setIsSidebarOpen((open) => !open);
+      return;
+    }
+
+    setIsSidebarCollapsed((collapsed) => !collapsed);
   }
 
   function handleMessagesScroll() {
@@ -343,7 +464,15 @@ export default function App() {
   }
 
   function scrollMessagesToBottom(behavior: ScrollBehavior) {
-    messagesEndRef.current?.scrollIntoView({ behavior, block: "end" });
+    const element = messagesScrollRef.current;
+    if (!element) {
+      return;
+    }
+
+    element.scrollTo({
+      top: element.scrollHeight,
+      behavior
+    });
   }
 
   function deleteConversation(conversationId: string) {
@@ -459,14 +588,11 @@ export default function App() {
     }
   }
 
-  async function submitMessage(event?: FormEvent) {
-    event?.preventDefault();
-    const content = draft.trim();
+  async function submitMessage(content: string) {
     if (!content || !activeConversation || isGenerating) {
       return;
     }
 
-    setDraft("");
     setError(null);
 
     const timestamp = nowIso();
@@ -491,16 +617,9 @@ export default function App() {
       activeConversation.id,
       nextMessages,
       activeConversation.model,
-      webSearchEnabled,
-      webSearchIntensity
+      deepThinkingEnabled,
+      webSearchEnabled
     );
-  }
-
-  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && event.ctrlKey) {
-      event.preventDefault();
-      void submitMessage();
-    }
   }
 
   function stopGeneration() {
@@ -568,21 +687,23 @@ export default function App() {
       activeConversation.id,
       nextMessages,
       activeConversation.model,
-      webSearchEnabled,
-      webSearchIntensity
+      deepThinkingEnabled,
+      webSearchEnabled
     );
   }
 
-  async function regenerateLastReply() {
+  async function regenerateReply(messageId: string) {
     if (!activeConversation || isGenerating) {
       return;
     }
 
-    const messages = [...activeConversation.messages];
-    while (messages.length && messages[messages.length - 1].role === "assistant") {
-      messages.pop();
+    const messageIndex = activeConversation.messages.findIndex((message) => message.id === messageId);
+    const target = activeConversation.messages[messageIndex];
+    if (messageIndex < 0 || target.role !== "assistant") {
+      return;
     }
 
+    const messages = activeConversation.messages.slice(0, messageIndex);
     if (!messages.length || messages[messages.length - 1].role !== "user") {
       return;
     }
@@ -597,15 +718,21 @@ export default function App() {
       )
     );
 
-    await requestAssistant(activeConversation.id, messages, activeConversation.model, webSearchEnabled, webSearchIntensity);
+    await requestAssistant(
+      activeConversation.id,
+      messages,
+      activeConversation.model,
+      deepThinkingEnabled,
+      webSearchEnabled
+    );
   }
 
   async function requestAssistant(
     conversationId: string,
     messages: ChatMessage[],
     model: ChatModel,
-    useWebSearch: boolean,
-    searchIntensity: WebSearchIntensity
+    useDeepThinking: boolean,
+    useWebSearch: boolean
   ) {
     const assistantMessage: ChatMessage = {
       id: makeId(),
@@ -620,9 +747,10 @@ export default function App() {
       conversationId,
       messageId: assistantMessage.id,
       webSearchEnabled: useWebSearch,
-      webSearchIntensity: searchIntensity
+      webSearchIntensity: "deep",
+      deepThinkingEnabled: useDeepThinking
     });
-    setSearching(useWebSearch);
+    setSearching(false);
     appendAssistantPlaceholder(conversationId, assistantMessage);
 
     let responseText = "";
@@ -638,7 +766,8 @@ export default function App() {
         body: JSON.stringify({
           model,
           messages: messages.map(({ role, content }) => ({ role, content })),
-          webSearch: { enabled: useWebSearch, intensity: searchIntensity }
+          thinking: { enabled: useDeepThinking },
+          webSearch: { enabled: useWebSearch, intensity: "deep" }
         }),
         signal: controller.signal
       });
@@ -652,6 +781,11 @@ export default function App() {
       }
 
       await readChatStream(response.body, (event) => {
+        if (event.type === "search_status") {
+          setSearching(event.status === "searching");
+          return;
+        }
+
         if (event.type === "search_results") {
           searchContext = event.search;
           setSearching(false);
@@ -771,24 +905,23 @@ export default function App() {
   }
 
   return (
-    <div className={`app-shell ${isSidebarOpen ? "is-sidebar-open" : ""}`}>
+    <div
+      className={`app-shell ${isSidebarOpen ? "is-sidebar-open" : ""} ${
+        isSidebarCollapsed ? "is-sidebar-collapsed" : ""
+      }`}
+    >
       <aside className="sidebar" aria-label="会话">
         <div className="sidebar-header">
           <div className="brand">
             <span className="brand-mark">
               <Bot size={18} />
             </span>
-            <span>DeepSeek</span>
+            <span>Chatbot</span>
           </div>
           <button className="icon-button" type="button" title="新建对话" onClick={startNewConversation}>
             <Plus size={18} />
           </button>
         </div>
-
-        <button className="new-chat-button" type="button" onClick={startNewConversation}>
-          <Plus size={18} />
-          新对话
-        </button>
 
         <div className="conversation-list">
           {sortedConversations.map((conversation) => (
@@ -886,7 +1019,7 @@ export default function App() {
               className="topbar-icon"
               type="button"
               title="打开或关闭会话栏"
-              onClick={() => setIsSidebarOpen((open) => !open)}
+              onClick={toggleSidebar}
             >
               <PanelLeft size={18} />
             </button>
@@ -897,22 +1030,21 @@ export default function App() {
           </div>
 
           <div className="topbar-controls">
-            <div className="model-switcher" aria-label="模型选择">
-              {MODEL_OPTIONS.map((model) => (
-                <button
-                  className={`model-pill ${(activeConversation?.model ?? DEFAULT_MODEL) === model.id ? "is-active" : ""}`}
-                  type="button"
-                  key={model.id}
-                  onClick={() => updateActiveModel(model.id)}
-                  disabled={isGenerating}
-                  aria-pressed={(activeConversation?.model ?? DEFAULT_MODEL) === model.id}
-                  title={`${model.label} - ${model.description}`}
-                >
-                  <span className="model-pill-label">{model.label}</span>
-                  <span className="model-pill-desc">{model.description}</span>
-                </button>
-              ))}
-            </div>
+            <label className="model-select">
+              <span>模型</span>
+              <select
+                aria-label="模型选择"
+                value={activeConversation?.model ?? DEFAULT_MODEL}
+                onChange={(event) => updateActiveModel(event.currentTarget.value as ChatModel)}
+                disabled={isGenerating}
+              >
+                {MODEL_OPTIONS.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.label}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
         </header>
 
@@ -930,12 +1062,15 @@ export default function App() {
             activeConversation.messages.map((message) => (
               <article className={`message ${message.role}`} key={message.id}>
                 <div className="avatar" aria-hidden="true">
-                  {message.role === "assistant" ? <Bot size={18} /> : "我"}
+                  {message.role === "assistant" ? <Bot size={18} /> : <User size={17} />}
                 </div>
                 <div className="message-body">
                   <div className="message-meta">
-                    <span>{message.role === "assistant" ? "DeepSeek" : "你"}</span>
-                    {message.search ? <span>已联网</span> : null}
+                    <span>{message.role === "assistant" ? "Chatbot" : "你"}</span>
+                    {message.search ? <span className="search-badge">已联网</span> : null}
+                    {message.role === "assistant" && message.usage ? (
+                      <span className="usage-badge">{formatUsageSummary(message.usage)}</span>
+                    ) : null}
                     {message.editedAt ? <span>已编辑</span> : null}
                     {generation?.messageId === message.id ? <span>生成中</span> : null}
                   </div>
@@ -967,7 +1102,7 @@ export default function App() {
                             <ReactMarkdown
                               remarkPlugins={[remarkGfm]}
                               rehypePlugins={[rehypeSanitize]}
-                              components={markdownComponents}
+                              components={reasoningMarkdownComponents}
                             >
                               {message.reasoningContent}
                             </ReactMarkdown>
@@ -976,16 +1111,13 @@ export default function App() {
                       ) : null}
                       <div className="markdown-body">
                         {message.content ? (
-                          <ReactMarkdown
-                            remarkPlugins={[remarkGfm]}
-                            rehypePlugins={[rehypeSanitize]}
-                            components={markdownComponents}
-                          >
-                            {message.content}
-                          </ReactMarkdown>
+                          <MarkdownContent
+                            content={message.content}
+                            search={message.role === "assistant" ? message.search : undefined}
+                          />
                         ) : (
                           <span className="typing-cursor">
-                            {generation?.messageId === message.id && generation.webSearchEnabled && !message.search
+                            {generation?.messageId === message.id && searching
                               ? "正在搜索网页..."
                               : message.reasoningContent
                                 ? "正在整理回答..."
@@ -996,6 +1128,20 @@ export default function App() {
                       {message.role === "assistant" && message.search ? <SearchSources search={message.search} /> : null}
                     </>
                   )}
+
+                  {message.role === "assistant" && editingMessageId !== message.id ? (
+                    <div className="message-actions">
+                      <button
+                        className="ghost-button"
+                        type="button"
+                        onClick={() => void regenerateReply(message.id)}
+                        disabled={isGenerating || !canRegenerateReply(activeConversation, message.id)}
+                      >
+                        <RefreshCw size={15} />
+                        重新生成
+                      </button>
+                    </div>
+                  ) : null}
 
                   {message.role === "user" && editingMessageId !== message.id ? (
                     <div className="message-actions">
@@ -1020,7 +1166,6 @@ export default function App() {
               <p>选择模型后发送第一条消息。</p>
             </div>
           )}
-          <div ref={messagesEndRef} />
         </section>
 
         <footer className="composer-wrap">
@@ -1028,61 +1173,34 @@ export default function App() {
             <div className="composer-tools">
               <ContextHud summary={tokenSummary} />
               <button
-                className={`web-toggle ${webSearchEnabled ? "is-active" : ""}`}
+                className={`tool-toggle ${deepThinkingEnabled ? "is-active" : ""}`}
+                type="button"
+                onClick={() => setDeepThinkingEnabled((enabled) => !enabled)}
+                disabled={isGenerating}
+                title="启用 DeepSeek 深度思考输出"
+                aria-pressed={deepThinkingEnabled}
+              >
+                <BrainCircuit size={16} />
+                深度思考
+              </button>
+              <button
+                className={`tool-toggle ${webSearchEnabled ? "is-active" : ""}`}
                 type="button"
                 onClick={() => setWebSearchEnabled((enabled) => !enabled)}
                 disabled={isGenerating}
-                title="本轮使用本地 SearXNG 搜索"
+                title="允许模型在需要时使用本地 SearXNG 搜索，默认高强度无限搜索"
+                aria-pressed={webSearchEnabled}
               >
-                <Globe2 size={15} />
-                Web
-              </button>
-              {webSearchEnabled ? (
-                <div className="search-strength" aria-label="搜索强度">
-                  {WEB_SEARCH_INTENSITY_OPTIONS.map((option) => (
-                    <button
-                      className={`strength-button ${webSearchIntensity === option.id ? "is-active" : ""}`}
-                      type="button"
-                      key={option.id}
-                      onClick={() => setWebSearchIntensity(option.id)}
-                      disabled={isGenerating}
-                      title={option.description}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-              {searching ? <span className="search-status">正在搜索 SearXNG...</span> : null}
-              <button
-                className="ghost-button"
-                type="button"
-                onClick={() => void regenerateLastReply()}
-                disabled={isGenerating || !canRegenerate(activeConversation)}
-              >
-                <RefreshCw size={15} />
-                重新生成
+                <Globe2 size={16} />
+                智能搜索
               </button>
             </div>
-            <form className="composer" onSubmit={(event) => void submitMessage(event)}>
-              <textarea
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                onKeyDown={handleComposerKeyDown}
-                placeholder="给 DeepSeek 发送消息"
-                rows={1}
-                disabled={isGenerating}
-              />
-              {isGenerating ? (
-                <button className="send-button stop" type="button" title="停止生成" onClick={stopGeneration}>
-                  <Square size={18} />
-                </button>
-              ) : (
-                <button className="send-button" type="submit" title="发送" disabled={!draft.trim()}>
-                  <Send size={18} />
-                </button>
-              )}
-            </form>
+            <ComposerInput
+              resetKey={activeConversation?.id ?? ""}
+              isGenerating={isGenerating}
+              onSubmitMessage={submitMessage}
+              onStopGeneration={stopGeneration}
+            />
           </div>
         </footer>
       </main>
@@ -1095,41 +1213,33 @@ function buildTitle(content: string): string {
   return compact ? compact.slice(0, 32) : "新对话";
 }
 
-function canRegenerate(conversation?: Conversation): boolean {
+function canRegenerateReply(conversation: Conversation | undefined, messageId: string): boolean {
   if (!conversation?.messages.length) {
     return false;
   }
 
-  const messages = [...conversation.messages];
-  while (messages.length && messages[messages.length - 1].role === "assistant") {
-    messages.pop();
+  const messageIndex = conversation.messages.findIndex((message) => message.id === messageId);
+  if (messageIndex < 0 || conversation.messages[messageIndex].role !== "assistant") {
+    return false;
   }
 
-  return Boolean(messages.length && messages[messages.length - 1].role === "user");
+  return conversation.messages[messageIndex - 1]?.role === "user";
 }
 
-function buildTokenSummary(conversation?: Conversation): TokenSummary {
+function getModelContextLimitTokens(metadata: ChatModelMetadata[], model?: ChatModel): number {
+  if (!model) {
+    return 0;
+  }
+
+  return metadata.find((entry) => entry.id === model)?.contextLengthTokens ?? 0;
+}
+
+function buildTokenSummary(conversation: Conversation | undefined, contextLimitTokens: number): TokenSummary {
   const estimatedContextTokens = estimateConversationContextTokens(conversation);
   return {
     estimatedContextTokens,
-    remainingContextTokens: Math.max(0, DEEPSEEK_CONTEXT_TOKENS - estimatedContextTokens),
-    contextLimitTokens: DEEPSEEK_CONTEXT_TOKENS,
-    lastUsage: findLastTokenUsage(conversation)
+    contextLimitTokens
   };
-}
-
-function findLastTokenUsage(conversation?: Conversation): TokenUsage | undefined {
-  if (!conversation) {
-    return undefined;
-  }
-
-  for (let index = conversation.messages.length - 1; index >= 0; index -= 1) {
-    const usage = conversation.messages[index].usage;
-    if (usage) {
-      return usage;
-    }
-  }
-  return undefined;
 }
 
 function estimateConversationContextTokens(conversation?: Conversation): number {
@@ -1175,6 +1285,10 @@ function formatTokenCount(value: number): string {
     return `${trimNumber(value / 1_000)}K`;
   }
   return String(Math.round(value));
+}
+
+function formatUsageSummary(usage: TokenUsage): string {
+  return `输入 ${formatTokenCount(usage.promptTokens)} / 输出 ${formatTokenCount(usage.completionTokens)}`;
 }
 
 function trimNumber(value: number): string {
@@ -1227,6 +1341,33 @@ function normalizeImportedConversations(value: Partial<StoredChatState>): Conver
     }));
 }
 
+function normalizeModelMetadataResponse(value: unknown): ChatModelMetadata[] {
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+
+  const models = (value as { models?: unknown }).models;
+  if (!Array.isArray(models)) {
+    return [];
+  }
+
+  return models.filter((model): model is ChatModelMetadata => {
+    if (!model || typeof model !== "object") {
+      return false;
+    }
+
+    const candidate = model as Partial<ChatModelMetadata>;
+    return (
+      (candidate.id === "deepseek-v4-flash" || candidate.id === "deepseek-v4-pro") &&
+      typeof candidate.object === "string" &&
+      typeof candidate.ownedBy === "string" &&
+      typeof candidate.contextLengthTokens === "number" &&
+      Number.isFinite(candidate.contextLengthTokens) &&
+      candidate.contextLengthTokens > 0
+    );
+  });
+}
+
 async function readErrorResponse(response: Response): Promise<string> {
   const text = await response.text();
   if (!text) {
@@ -1275,7 +1416,13 @@ function handleStreamLine(line: string, onEvent: (event: StreamEvent) => void): 
     return;
   }
 
-  const parsed = JSON.parse(trimmed) as { type?: string; content?: unknown; search?: unknown; usage?: unknown };
+  const parsed = JSON.parse(trimmed) as {
+    type?: string;
+    content?: unknown;
+    search?: unknown;
+    status?: unknown;
+    usage?: unknown;
+  };
   if (
     (parsed.type === "reasoning" || parsed.type === "content" || parsed.type === "error") &&
     typeof parsed.content === "string"
@@ -1286,6 +1433,11 @@ function handleStreamLine(line: string, onEvent: (event: StreamEvent) => void): 
 
   if (parsed.type === "search_results" && isWebSearchContext(parsed.search)) {
     onEvent({ type: "search_results", search: parsed.search });
+    return;
+  }
+
+  if (parsed.type === "search_status" && parsed.status === "searching") {
+    onEvent({ type: "search_status", status: "searching" });
     return;
   }
 
@@ -1333,6 +1485,44 @@ function formatSourceHost(url: string, engine?: string): string {
   } catch {
     return engine ?? url;
   }
+}
+
+function getSourceTitleByUrl(search: WebSearchContext | undefined, url: string): string | undefined {
+  const source = search?.results.find((result) => result.url === url);
+  if (!source) {
+    return undefined;
+  }
+
+  return `打开来源：${source.title}`;
+}
+
+function linkifySearchCitations(content: string, search?: WebSearchContext): string {
+  if (!search?.results.length) {
+    return content;
+  }
+
+  return content
+    .split(/(```[\s\S]*?```|`[^`\n]*`)/g)
+    .map((part) => {
+      if (part.startsWith("`")) {
+        return part;
+      }
+
+      return part.replace(/(?<!\[)\[(\d+)\](?!\()/g, (match, rawIndex: string) => {
+        const index = Number.parseInt(rawIndex, 10);
+        if (!Number.isFinite(index) || index < 1) {
+          return match;
+        }
+
+        const source = search.results[index - 1];
+        if (!source) {
+          return `[${index}]`;
+        }
+
+        return `[[${index}]](<${source.url}>)`;
+      });
+    })
+    .join("");
 }
 
 function extractText(node: ReactNode): string {
