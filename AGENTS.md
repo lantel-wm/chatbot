@@ -121,6 +121,60 @@ Current Web Search behavior:
 - The frontend sends high/unlimited search intensity by default.
 - The backend saves only query/title/URL/snippet source metadata with the assistant message.
 
+### SearXNG Proxy
+
+If search engines return empty results, CAPTCHA, `403`, `429`, or connection errors, configure SearXNG's outbound proxy in `searxng/settings.yml` under `outgoing.proxies`.
+
+Before deployment, check the proxy URL already present in `searxng/settings.yml`. It may be a local-machine example such as `http://192.168.x.x:1087`; replace it with an address that is reachable from the SearXNG Docker container on the target machine.
+
+Example for a host-machine HTTP proxy on macOS / Windows Docker Desktop:
+
+```yaml
+outgoing:
+  request_timeout: 10.0
+  extra_proxy_timeout: 10
+  proxies:
+    "all://":
+      - http://host.docker.internal:7890
+```
+
+Example for a SOCKS proxy:
+
+```yaml
+outgoing:
+  request_timeout: 10.0
+  extra_proxy_timeout: 10
+  proxies:
+    "all://":
+      - socks5h://host.docker.internal:1080
+```
+
+Important details:
+
+- Do not use `127.0.0.1` for a proxy running on the host machine; inside Docker it means the SearXNG container itself.
+- On macOS and Windows Docker Desktop, use `host.docker.internal:<proxy-port>`.
+- On Linux Docker, either bind the proxy to a reachable LAN / bridge address, or add Docker host gateway mapping in `searxng/docker-compose.yml`:
+
+```yaml
+services:
+  searxng:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+Then use `http://host.docker.internal:<proxy-port>` or `socks5h://host.docker.internal:<proxy-port>` in `settings.yml`.
+
+After changing proxy settings, restart SearXNG and verify:
+
+```bash
+npm run search:down
+npm run search:up
+curl 'http://127.0.0.1:8888/search?q=test&format=json'
+curl http://127.0.0.1:3001/api/search/health
+```
+
+Official reference: SearXNG `outgoing.proxies` supports one or more proxy URLs under protocol keys such as `"all://"`; multiple proxies are load-balanced round-robin.
+
 ## Validation
 
 Run before handing off changes:

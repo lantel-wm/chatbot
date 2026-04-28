@@ -44,6 +44,8 @@ curl http://127.0.0.1:3001/api/search/health
 
 `SEARXNG_ENGINE_CANDIDATES` 是探测候选池，不是固定使用的引擎列表。后端会在执行 Web Search 前逐个探测候选引擎，把当前可用的引擎动态传给 SearXNG；探测结果按 `SEARXNG_ENGINE_PROBE_TTL_MS` 缓存，避免每一轮都探测。也可以把候选值设为 `auto`，让后端从 SearXNG `/config` 发现候选引擎。`WEB_SEARCH_DELAY_MS` 是后端对所有 SearXNG 请求的全局串行节流间隔，默认 1500ms，用于降低连续搜索触发上游限流的概率。
 
+如果需要让 SearXNG 通过代理访问外部搜索引擎，请按自己的环境修改 `searxng/settings.yml` 的 `outgoing.proxies`。仓库中的代理地址如 `192.168.x.x:1087` 仅是本机示例，部署到新机器时必须替换为可被 Docker 容器访问的代理地址；macOS / Windows Docker Desktop 通常使用 `host.docker.internal:<proxy-port>`。
+
 停止搜索服务：
 
 ```bash
